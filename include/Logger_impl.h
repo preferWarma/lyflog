@@ -3,6 +3,11 @@
 #include "LogQue.h"
 #include "sinks/ISink.h"
 
+#include <mutex>
+#include <shared_mutex>
+#include <typeindex>
+#include <unordered_map>
+
 #ifdef __linux__
 #include <pthread.h>
 #include <sched.h>
@@ -31,11 +36,85 @@ public:
     // Sinks 会在析构时自动 Flush
   }
 
-  void AddSink(std::shared_ptr<ILogSink> sink) { sinks_.push_back(sink); }
+  // ==================== Sink 管理接口 ====================
+  template <typename T> bool AddSink(std::shared_ptr<T> sink) {
+    static_assert(std::is_base_of_v<ILogSink, T>,
+                  "T must derive from ILogSink");
+    if (!sink) {
+      return false; // 无效的 Sink
+    }
+    std::unique_lock lock(sinks_mutex_);
+
+    auto type_idx = std::type_index(typeid(T));
+    if (sinks_map_.contains(type_idx)) {
+      return false; // 该类型已存在
+    }
+    sinks_map_[type_idx] = sink;
+    UpdateSinkCacheLocked();
+    return true;
+  }
+
+  template <typename T> bool HasSink() const {
+    static_assert(std::is_base_of_v<ILogSink, T>,
+                  "T must derive from ILogSink");
+    std::shared_lock lock(sinks_mutex_);
+    return sinks_map_.contains(std::type_index(typeid(T)));
+  }
+
+  template <typename T> bool RemoveSink() {
+    static_assert(std::is_base_of_v<ILogSink, T>,
+                  "T must derive from ILogSink");
+    std::unique_lock lock(sinks_mutex_);
+
+    auto type_idx = std::type_index(typeid(T));
+    auto it = sinks_map_.find(type_idx);
+    if (it == sinks_map_.end()) {
+      return false; // 该类型 Sink 不存在
+    }
+
+    if (it->second) {
+      it->second->Flush();
+    }
+
+    sinks_map_.erase(it);
+    UpdateSinkCacheLocked();
+    return true;
+  }
+
+  template <typename T> std::shared_ptr<T> GetSink() const {
+    static_assert(std::is_base_of_v<ILogSink, T>,
+                  "T must derive from ILogSink");
+    std::shared_lock lock(sinks_mutex_);
+
+    auto it = sinks_map_.find(std::type_index(typeid(T)));
+    if (it == sinks_map_.end()) {
+      return nullptr;
+    }
+    return std::static_pointer_cast<T>(it->second);
+  }
+
+  size_t GetSinkCount() const {
+    std::shared_lock lock(sinks_mutex_);
+    return sinks_map_.size();
+  }
+
+  void ClearSinks() {
+    std::unique_lock lock(sinks_mutex_);
+    for (auto &[type_idx, sink] : sinks_map_) {
+      if (sink) {
+        sink->Flush();
+      }
+    }
+    sinks_map_.clear();
+    UpdateSinkCacheLocked();
+  }
+
+  // ==================== 日志提交接口 ====================
   bool Commit(LogMessage &&msg) { return queue_.Push(std::move(msg)); }
 
   void Flush() {
-    for (auto &sink : sinks_) {
+    std::shared_lock lock(sinks_mutex_);
+    for (auto &sink : sinks_cache_) {
       sink->Flush();
     }
   }
@@ -43,13 +122,14 @@ public:
   void Sync() {
     std::promise<void> prom;
     std::future<void> fut = prom.get_future();
-    // 构造 FLUSH 消息推入队列
+    // 构造 FlushMessage 并提交到队列
     if (queue_.Push(LogMessage(&prom), true)) {
-      // 等待 Worker 处理到这条消息
+      // 等待 FlushMessage 处理完成
       fut.wait();
     }
-    // 强制落盘
-    for (auto &sink : sinks_) {
+
+    std::shared_lock lock(sinks_mutex_);
+    for (auto &sink : sinks_cache_) {
       sink->Sync();
     }
   }
@@ -65,6 +145,15 @@ private:
   void UpdateNow() {
     coarse_time_ns_.store(system_clock::now().time_since_epoch().count(),
                           std::memory_order_relaxed);
+  }
+
+  // 在持有写锁的情况下更新sink缓存
+  void UpdateSinkCacheLocked() {
+    sinks_cache_.clear();
+    sinks_cache_.reserve(sinks_map_.size());
+    for (auto &[type_idx, sink] : sinks_map_) {
+      sinks_cache_.push_back(sink);
+    }
   }
 
   void TimerLoop() {
@@ -95,10 +184,15 @@ private:
     while (running_ || queue_.size_approx() > 0) {
       size_t count = queue_.PopBatch(buffer_batch, batch_size);
       if (count > 0) {
+        // 使用缓存的 sink 列表（读锁保护）
+        std::shared_lock lock(sinks_mutex_);
+        auto sinks = sinks_cache_; // 复制一份避免长时间持有锁
+        lock.unlock();             // 尽快释放锁
+
         for (const auto &msg : buffer_batch) {
           if (msg.level == LogLevel::FLUSH) {
             // 遇到 Flush 指令，先强制刷新所有 Sink
-            for (auto &sink : sinks_) {
+            for (auto &sink : sinks) {
               sink->Flush();
             }
             // 通知主线程 Flush 指令之前的数据都处理完了
@@ -107,7 +201,7 @@ private:
             }
             continue;
           }
-          for (auto &sink : sinks_) {
+          for (auto &sink : sinks) {
             sink->Log(msg);
           }
         }
@@ -118,7 +212,7 @@ private:
           std::this_thread::sleep_for(
               std::chrono::microseconds(LogConfig::kDefaultWorkerIdleSleepUs));
         } else {
-          break; // running=false 且队列空，彻底退出
+          break;
         }
       }
     }
@@ -130,11 +224,15 @@ private:
   std::atomic<bool> running_;
   std::thread worker_thread_;
   std::atomic<size_t> drop_cnt_{0};
-  std::vector<std::shared_ptr<ILogSink>> sinks_;
 
-  // 时间更新线程
+  // Sink 管理（类型 -> Sink 的映射）
+  mutable std::shared_mutex sinks_mutex_;
+  std::unordered_map<std::type_index, std::shared_ptr<ILogSink>> sinks_map_;
+  // 缓存的 Sink 列表（用于快速遍历，避免频繁访问 map）
+  std::vector<std::shared_ptr<ILogSink>> sinks_cache_;
+
   std::thread timer_thread_;
-  std::atomic<int64_t> coarse_time_ns_{0}; // 粗粒度时间戳
+  std::atomic<int64_t> coarse_time_ns_{0};
 };
 
 } // namespace lyf

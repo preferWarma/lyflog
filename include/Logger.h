@@ -56,12 +56,31 @@ public:
     }
   }
 
-  void AddSink(std::shared_ptr<ILogSink> sink) {
-    if (impl_) {
-      sink->ApplyConfig(owned_config_);
-      impl_->AddSink(sink);
+  template <typename T> bool HasSink() { return impl_ && impl_->HasSink<T>(); }
+
+  template <typename T> bool AddSink(std::shared_ptr<T> sink) {
+    static_assert(std::is_base_of_v<ILogSink, T>,
+                  "T must derive from ILogSink");
+    if (!sink || !impl_) {
+      return false;
     }
+    // 检查目标类型的 sink 是否已存在
+    if (impl_->HasSink<T>()) {
+      return false;
+    }
+    sink->ApplyConfig(owned_config_);
+    return impl_->AddSink(sink);
   }
+
+  template <typename T> bool RemoveSink() {
+    return impl_ && impl_->RemoveSink<T>();
+  }
+
+  template <typename T> std::shared_ptr<T> GetSink() {
+    return impl_ ? impl_->GetSink<T>() : nullptr;
+  }
+
+  size_t GetSinkCount() const { return impl_ ? impl_->GetSinkCount() : 0; }
 
   void Flush() {
     if (impl_) {

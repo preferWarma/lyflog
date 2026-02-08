@@ -5,6 +5,7 @@ add_executable(unit_tests
   test_log_queue.cpp
   test_file_sink_rotate.cpp
   test_http_sink.cpp
+  test_sink_manager.cpp
 )
 
 target_include_directories(unit_tests PRIVATE ${PROJECT_SOURCE_DIR}/include)

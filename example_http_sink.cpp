@@ -26,7 +26,7 @@ int main() {
   http_cfg.max_retries = 3;
   http_cfg.batch_size = 50;
   http_cfg.flush_interval_ms = 3000;
-  auto httpSink = std::make_unique<HttpSink>(http_cfg);
+  auto httpSink = std::make_shared<HttpSink>(http_cfg);
 
   // 添加到Sink管理器
   Logger::Instance().AddSink(std::move(httpSink));
