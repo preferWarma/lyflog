@@ -260,7 +260,9 @@ int main(int argc, char **argv) {
 
   uint64_t drop_count = Logger::Instance().GetDropCount();
   // 停止 Logger
+  size_t shutdown_begin_ns = NowNs();
   Logger::Instance().Shutdown();
+  size_t shutdown_end_ns = NowNs();
 
   uint64_t logfile_size_MB = 0;
   if (cfg.sink != "console") {
@@ -275,6 +277,8 @@ int main(int argc, char **argv) {
   std::cout << "total time: " << total_time_ns / 1e9 << " s" << std::endl;
   std::cout << "submit time: " << submit_time_ns / 1e9 << " s" << std::endl;
   std::cout << "sync time: " << sync_time_ns / 1e9 << " s" << std::endl;
+  std::cout << "shutdown time: " << (shutdown_end_ns - shutdown_begin_ns) / 1e9
+            << " s" << std::endl;
   std::cout << "avg submit latency: " << avg_ns << " ns" << std::endl;
   std::cout << "min/max latency: " << min_lat_ns << "/" << max_lat_ns << " ns"
             << std::endl;
