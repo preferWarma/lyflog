@@ -1,61 +1,50 @@
-// // HttpSink使用示例
-// #include "LogSystem.h"
-// #include <iostream>
+// HttpSink 使用示例
+#include "LogConfig.h"
+#include "Logger.h"
+#include "sinks/HttpSink.h"
 
-// using namespace lyf;
+using namespace lyf;
 
-// int main() {
-//   // 初始化日志系统
-//   INIT_LOG_SYSTEM("config.toml");
+int main() {
+  // 初始化日志系统
+  auto log_cfg =
+      LogConfig()
+          .SetLevel(LogLevel::DEBUG)
+          .SetLogPath("") // filesink 路径设置为空，避免自动添加 filesink
+          .SetWorkerBatchSize(1024);
+  Logger::Instance().Init(log_cfg);
 
-//   std::cout << "=== HttpSink使用示例 ===" << std::endl;
-//   std::cout << "当前配置的Sink数量: "
-//             << AsyncLogSystem::Instance().GetSinkManager().GetSinkCount()
-//             << std::endl;
+  std::cout << "=== HttpSink使用示例 ===" << std::endl;
 
-//   // 方法1: 通过配置文件启用HttpSink
-//   // 在config.toml中设置 [http] 部分的参数和 toHttp = true
+  // 创建 HttpSink
+  HttpSinkConfig http_cfg;
+  http_cfg.host = "127.0.0.1";
+  http_cfg.port = 8080;
+  http_cfg.endpoint = "/api/logs"; // API端点
+  http_cfg.content_type = "application/json";
+  http_cfg.timeout_ms = 5000;
+  http_cfg.max_retries = 3;
+  http_cfg.batch_size = 50;
+  http_cfg.flush_interval_ms = 3000;
+  auto httpSink = std::make_unique<HttpSink>(http_cfg);
 
-//   // 方法2: 动态添加HttpSink
-//   auto httpSink = std::make_unique<HttpSink>();
-//   HttpSink::HttpConfig httpConfig;
-//   httpConfig.url = "http://localhost:8080"; // 设置HTTP服务器地址
-//   httpConfig.endpoint = "/api/logs";        // API端点
-//   httpConfig.contentType = "application/json";
-//   httpConfig.timeout_sec = 10;
-//   httpConfig.maxRetries = 3;
-//   httpConfig.batchSize = 50;
-//   httpConfig.bufferSize_kb = 32;
-//   httpConfig.enableCompression = false;
-//   httpConfig.enableAsync = true;
-//   httpSink->SetHttpConfig(httpConfig);
+  // 添加到Sink管理器
+  Logger::Instance().AddSink(std::move(httpSink));
 
-//   // 添加到Sink管理器
-//   if (AsyncLogSystem::Instance().AddSink(std::move(httpSink))) {
-//     std::cout << "HttpSink已成功添加到日志系统" << std::endl;
-//   } else {
-//     std::cout << "HttpSink添加失败" << std::endl;
-//   }
+  // 记录一些测试日志
+  DEBUG("这是一条DEBUG级别的日志");
+  INFO("这是一条INFO级别的日志");
+  WARN("这是一条WARNING级别的日志");
+  ERROR("这是一条ERROR级别的日志");
 
-//   std::cout << "添加HttpSink后的Sink数量: "
-//             << AsyncLogSystem::Instance().GetSinkManager().GetSinkCount()
-//             << std::endl;
+  // 批量日志测试
+  for (int i = 0; i < 100; ++i) {
+    INFO("批量日志测试 - 消息编号: {}", i);
+  }
 
-//   // 记录一些测试日志
-//   LOG_DEBUG("这是一条DEBUG级别的日志");
-//   LOG_INFO("这是一条INFO级别的日志");
-//   LOG_WARN("这是一条WARNING级别的日志");
-//   LOG_ERROR("这是一条ERROR级别的日志");
+  // 刷新所有日志
+  Logger::Instance().Sync();
+  std::cout << "日志已刷新" << std::endl;
 
-//   // 批量日志测试
-//   for (int i = 0; i < 100; ++i) {
-//     LOG_INFO("批量日志测试 - 消息编号: {}", i);
-//   }
-
-//   // 刷新所有日志
-//   AsyncLogSystem::Instance().Flush();
-
-//   std::cout << "日志已刷新" << std::endl;
-
-//   return 0;
-// }
+  return 0;
+}

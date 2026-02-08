@@ -10,10 +10,10 @@ set(CMAKE_CXX_STANDARD 20) # 设置C++标准版本
 # option(ENABLE_ASAN "Enable Address Sanitizer" OFF)
 
 # if(ENABLE_ASAN)
-#     if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|AppleClang|GNU")
-#         add_compile_options(-fsanitize=address -fno-omit-frame-pointer -g)
-#         add_link_options(-fsanitize=address)
-#     endif()
+# if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|AppleClang|GNU")
+# add_compile_options(-fsanitize=address -fno-omit-frame-pointer -g)
+# add_link_options(-fsanitize=address)
+# endif()
 # endif()
 
 # 使用 O3 优化
@@ -34,13 +34,13 @@ FetchContent_MakeAvailable(gflags)
 # 添加可执行文件
 add_executable(main main.cpp)
 
-# add_executable(http_sink_example example_http_sink.cpp)
+add_executable(http_sink_example example_http_sink.cpp)
 
 # 添加包含目录
 target_include_directories(main PRIVATE ${PROJECT_SOURCE_DIR}/include) # 添加头文件
 target_link_libraries(main PRIVATE gflags::gflags)
 
-# target_include_directories(http_sink_example PRIVATE ${PROJECT_SOURCE_DIR}/include) # 添加头文件
+target_include_directories(http_sink_example PRIVATE ${PROJECT_SOURCE_DIR}/include) # 添加头文件
 
 option(BUILD_BENCHMARKS "Build benchmarks" ON)
 
