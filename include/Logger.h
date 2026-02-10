@@ -106,7 +106,7 @@ public:
   AsyncLogger *GetImpl() { return impl_.get(); }
   BufferPool *GetBufferPool() { return buffer_pool_.get(); }
   std::shared_ptr<BufferPool> GetBufferPoolShared() { return buffer_pool_; }
-  size_t GetDropCount() const { return impl_->GetDropCount(); }
+  size_t GetDropCount() const { return impl_ ? impl_->GetDropCount() : 0; }
   LogLevel GetLevel() const { return owned_config_.GetLevel(); }
   void SetLevel(LogLevel lv) { owned_config_.SetLevel(lv); }
   const LogConfig &GetConfig() const { return owned_config_; }

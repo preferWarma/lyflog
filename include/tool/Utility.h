@@ -1,9 +1,13 @@
 #pragma once
 #include "third/toml.hpp"
 
+#include <chrono>
+#include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -65,8 +69,15 @@ inline string CurrentTimeToString(const string &format = "%Y-%m-%d %H:%M:%S") {
   auto now = system_clock::now();
   auto time_t = system_clock::to_time_t(now);
   std::stringstream ss;
-  // 线程安全的时间格式化函数
-  ss << std::put_time(std::localtime(&time_t), format.c_str());
+#ifdef _WIN32
+  std::tm tm_buf;
+  localtime_s(&tm_buf, &time_t);
+  ss << std::put_time(&tm_buf, format.c_str());
+#else
+  std::tm tm_buf;
+  localtime_r(&time_t, &tm_buf);
+  ss << std::put_time(&tm_buf, format.c_str());
+#endif
   return ss.str();
 }
 

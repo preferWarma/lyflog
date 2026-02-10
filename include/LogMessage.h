@@ -35,6 +35,12 @@ public:
     }
     pool_.enqueue_bulk(batch.begin(), count);
   }
+  ~BufferPool() {
+    LogBuffer *buf = nullptr;
+    while (pool_.try_dequeue(buf)) {
+      delete buf;
+    }
+  }
 
   LogBuffer *Alloc() {
     LogBuffer *buf;
@@ -66,7 +72,7 @@ private:
 };
 
 struct LogMessage {
-  constexpr static std::hash<std::thread::id> hash_func;
+  inline static const std::hash<std::thread::id> hash_func{};
   using system_clock = std::chrono::system_clock;
 
   int64_t time;

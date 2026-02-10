@@ -168,6 +168,7 @@ private:
 #ifdef __linux__
     cpu_set_t cpuset;
     CPU_ZERO(&cpuset);
+    int core_id = 0;
     CPU_SET(core_id, &cpuset);
     pthread_setaffinity_np(pthread_self(), sizeof(cpuset), &cpuset);
 #elif defined(__APPLE__)
