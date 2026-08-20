@@ -1,6 +1,6 @@
 # CMakeLists.txt
 cmake_minimum_required(VERSION 3.20) # cmake的最低版本要求
-project(code_template_cmake CXX) # 项目名称 CXX表示C++项目
+project(lyflog CXX) # 项目名称 CXX表示C++项目
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 
 set(CMAKE_CXX_STANDARD_REQUIRED ON) # C++标准要求
@@ -19,51 +19,32 @@ set(CMAKE_CXX_STANDARD 20) # 设置C++标准版本
 # 使用 O3 优化
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3")
 
-# 在配置阶段执行命令，将配置文件复制到build文件夹下
-execute_process(COMMAND ${CMAKE_COMMAND} -E copy ${CMAKE_SOURCE_DIR}/config.toml ${CMAKE_BINARY_DIR}/config.toml)
-
 include(FetchContent)
+
 FetchContent_Declare(
-  gflags
-  URL https://github.com/gflags/gflags/archive/refs/tags/v2.2.2.zip
+  fmt
+  GIT_REPOSITORY https://github.com/fmtlib/fmt.git
+  GIT_TAG 12.1.0
+  GIT_SHALLOW TRUE
 )
-set(GFLAGS_BUILD_TESTING OFF CACHE BOOL "" FORCE)
-set(GFLAGS_BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
-FetchContent_MakeAvailable(gflags)
+set(FMT_TEST OFF CACHE BOOL "" FORCE)
+FetchContent_MakeAvailable(fmt)
+
+FetchContent_Declare(
+  concurrentqueue
+  GIT_REPOSITORY https://github.com/cameron314/concurrentqueue.git
+  GIT_TAG v1.0.4
+  GIT_SHALLOW TRUE
+)
+FetchContent_MakeAvailable(concurrentqueue)
+
+add_library(lyflog INTERFACE)
+target_include_directories(lyflog INTERFACE
+  ${CMAKE_CURRENT_SOURCE_DIR}
+  ${concurrentqueue_SOURCE_DIR}
+)
+target_link_libraries(lyflog INTERFACE fmt::fmt)
 
 # 添加可执行文件
-add_executable(main main.cpp)
-
-add_executable(http_sink_example example_http_sink.cpp)
-
-# 添加包含目录
-target_include_directories(main PRIVATE ${PROJECT_SOURCE_DIR}/include) # 添加头文件
-target_link_libraries(main PRIVATE gflags::gflags)
-
-target_include_directories(http_sink_example PRIVATE ${PROJECT_SOURCE_DIR}/include) # 添加头文件
-
-option(BUILD_BENCHMARKS "Build benchmarks" ON)
-
-if(BUILD_BENCHMARKS)
-  FetchContent_Declare(
-    benchmark
-    URL https://github.com/google/benchmark/archive/refs/tags/v1.8.3.zip
-  )
-  set(BENCHMARK_ENABLE_TESTING OFF CACHE BOOL "" FORCE)
-  FetchContent_MakeAvailable(benchmark)
-
-  add_subdirectory(benchmark)
-endif()
-
-include(CTest)
-
-if(BUILD_TESTING)
-  FetchContent_Declare(
-    googletest
-    URL https://github.com/google/googletest/archive/refs/tags/v1.14.0.zip
-  )
-  set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
-  FetchContent_MakeAvailable(googletest)
-
-  add_subdirectory(test)
-endif()
+add_executable(example example.cpp)
+target_link_libraries(example PRIVATE lyflog)
