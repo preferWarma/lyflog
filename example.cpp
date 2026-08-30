@@ -15,7 +15,7 @@ void demonstrate_levels_and_formatting() {
   LYF_WARN("cache hit rate is {:.1f}%", 73.48);
   LYF_ERROR("request {} failed with status={}", "req-002", 503);
 
-  // lyflog uses fmt syntax, so width, precision, bases, and alignment work too.
+  // 支持 fmt 的精度、进制、宽度和对齐格式。
   LYF_INFO("fmt examples: pi={:.3f}, hex=0x{:08x}, aligned='{:>8}'", 3.1415926,
            0x2a, "lyflog");
 }
@@ -32,7 +32,7 @@ void demonstrate_runtime_level() {
 }
 
 void demonstrate_interval_logging() {
-  // This loop runs five times, but the call site emits at most once per 200 ms.
+  // 循环五次，但此调用点每 200 ms 最多输出一次。
   for (int heartbeat = 1; heartbeat <= 5; ++heartbeat) {
     LYF_INTERVAL_INFO(0.2, "rate-limited heartbeat, iteration={}", heartbeat);
     std::this_thread::sleep_for(100ms);
@@ -81,15 +81,13 @@ void print_stats(const lyflog::Logger::Stats &stats) {
 int main() {
   constexpr const char *kLogPath = "logs/lyflog_example.log";
 
-  // Calling a LYF_* macro without init() also works and uses LogConfig
-  // defaults. Explicit initialization is shown here so an application can tune
-  // behavior.
+  // 未调用 init() 时自动使用默认配置；此处显式配置以展示常用选项。
   lyflog::LogConfig config;
   config.set_file_path(kLogPath)
       .set_level(lyflog::Level::Debug)
       .set_with_thread_id(true)
       .set_daily_rotate(false)
-      .set_max_file_size(1024 * 1024) // Rotate after approximately 1 MiB.
+      .set_max_file_size(1024 * 1024) // 约 1 MiB 后轮转。
       .set_retain_count(3)
       .set_queue_capacity(8192)
       .set_overflow_policy(lyflog::OverflowPolicy::Block);
@@ -100,16 +98,16 @@ int main() {
   demonstrate_levels_and_formatting();
   demonstrate_runtime_level();
   demonstrate_interval_logging();
+
+  // 仅等待当前线程此前提交的日志落盘。
+  logger.sync();
+
   demonstrate_multithreaded_logging();
 
-  // sync() is useful before inspecting the file or at an application
-  // checkpoint. shutdown() below also drains and flushes, but calling both
-  // demonstrates the API.
-  logger.sync();
+  // 停止后台线程并排空所有生产者的日志。
+  logger.shutdown();
   print_stats(logger.stats());
   std::cout << "log written to " << kLogPath
             << " (size rotation adds a numeric suffix)\n";
-
-  logger.shutdown();
   return 0;
 }

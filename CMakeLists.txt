@@ -3,6 +3,8 @@ cmake_minimum_required(VERSION 3.20) # cmake的最低版本要求
 project(lyflog CXX) # 项目名称 CXX表示C++项目
 set(CMAKE_POLICY_VERSION_MINIMUM 3.5)
 
+include(CTest)
+
 set(CMAKE_CXX_STANDARD_REQUIRED ON) # C++标准要求
 set(CMAKE_CXX_STANDARD 20) # 设置C++标准版本
 
@@ -48,3 +50,7 @@ target_link_libraries(lyflog INTERFACE fmt::fmt)
 # 添加可执行文件
 add_executable(example example.cpp)
 target_link_libraries(example PRIVATE lyflog)
+
+if(BUILD_TESTING)
+  add_subdirectory(tests)
+endif()

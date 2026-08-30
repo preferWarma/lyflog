@@ -1,16 +1,19 @@
-// lyflog.hpp —— 极简单头文件异步日志库 (C++17)
+// lyflog.h —— 极简单头文件异步日志库 (C++17)
 //
 // 用法：
-//   #include "lyflog.hpp"
+//   #include "lyflog.h"
 //   int main() {
 //     // (可选) 第一次 LYF_* 会自动采取默认参数初始化
-//     lyflog::Logger::instance().init( LogConfig().set_file_path("app.log")
-//                                                 .set_level(lyflog::Level::Info)
-//                                                 .set_retain_days(7));
+//     lyflog::LogConfig config;
+//     config.set_file_path("app.log")
+//           .set_level(lyflog::Level::Info)
+//           .set_retain_days(7);
+//     lyflog::Logger::instance().init(config);
 //     LYF_INFO("hello {} {}", "world", 42);
-//     LYF_INTERVAL_INFO(5, "heartbeat alive={} qps={}", alive, qps);  // 每 5
-//     秒最多一条 lyflog::Logger::instance().sync();   //
-//     等待落盘（可选，退出时也会自动 flush）
+//     LYF_INTERVAL_INFO(5, "heartbeat alive={} qps={}", alive, qps);
+//     // 等待当前线程此前提交的日志落盘；排空所有线程请用 shutdown()
+//     lyflog::Logger::instance().sync();
+//     lyflog::Logger::instance().shutdown();
 //   }
 
 #pragma once
@@ -266,7 +269,7 @@ struct RetiredPoolRegistry {
 
 // 队列中承载的一条记录。持有池化 Buffer 的所有权：仅可移动
 // 析构时自动把 Buffer 归还 BufferPool。
-// buffer_ptr 为空且 sync_prom 非空时表示一个 flush 屏障。
+// buffer_ptr 为空且 sync_prom 非空时表示一个生产者局部 flush 屏障。
 struct LogRecord {
   Level level = Level::Info;
   const char *file = nullptr; // __FILE__，指向静态字符串，无需拷贝
@@ -275,7 +278,7 @@ struct LogRecord {
   std::int64_t time_ns = 0;
   LogBuffer *buffer_ptr = nullptr;
   BufferPool *pool = nullptr;
-  // 非 null 表示 flush 屏障
+  // 非 null 表示生产者局部 flush 屏障
   std::shared_ptr<std::promise<void>> sync_prom;
 
   LogRecord() = default;
@@ -1060,7 +1063,7 @@ public:
     r.pool = pool.get(); // 消费后由 LogRecord 析构归还此池
     push(std::move(r));
 
-    // LYF_FATAL 落盘保证：Fatal 记录入队后追加 flush 屏障并等它被兑现。
+    // Fatal 与屏障同属一个生产者，FIFO 保证 Fatal 先落盘。
     if (lv == Level::Fatal &&
         fatal_sync_flush_.load(std::memory_order_relaxed) &&
         running_.load(std::memory_order_acquire)) {
@@ -1068,7 +1071,7 @@ public:
     }
   }
 
-  // 入队一条 flush 屏障并等待兑现（带 50ms 超时复查 running_)
+  // 插入调用线程的局部刷新屏障并等待；不排序其他生产者。
   void wait_flush_barrier() {
     std::promise<void> prom;
     std::future<void> fut = prom.get_future();
@@ -1086,7 +1089,8 @@ public:
     }
   }
 
-  // 阻塞直到此刻之前提交的日志全部落盘。带超时与 running 复查
+  // 等待调用线程此前提交的日志落盘；不排空其他生产者。
+  // 全局排空应先停止或汇合生产线程，再调用 shutdown()。
   void sync() {
     if (!running_.load(std::memory_order_acquire)) {
       return;
@@ -1170,7 +1174,7 @@ private:
         continue;
       }
       for (auto &r : batch) {
-        // flush 屏障：落盘并兑现
+        // 局部刷新屏障：刷新已处理内容并兑现。
         if (r.sync_prom) {
           sink_->flush();
           r.sync_prom->set_value();
