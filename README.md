@@ -55,18 +55,18 @@ LYF_INTERVAL_INFO(0.5, "heartbeat={}", heartbeat);
 
 ## 常用配置
 
-| 配置 | 默认值 | 说明 |
-| --- | --- | --- |
-| `file_path` | `app.log` | 日志文件路径 |
-| `level` | `Info` | 最低日志级别 |
-| `with_thread_id` | `false` | 输出线程 ID |
-| `daily_rotate` | `true` | 按天轮转 |
-| `retain_days` | `7` | 保留天数，0 表示不限制 |
-| `max_file_size` | `0` | 按大小轮转，0 表示关闭 |
-| `retain_count` | `0` | 轮转文件上限，0 表示不限制 |
-| `queue_capacity` | `65536` | 队列软上限 |
-| `overflow_policy` | `Block` | 队列满时阻塞或丢弃 |
-| `fatal_sync_flush` | `true` | Fatal 日志同步落盘 |
+| 配置               | 默认值    | 说明                       |
+| ------------------ | --------- | -------------------------- |
+| `file_path`        | `app.log` | 日志文件路径               |
+| `level`            | `Info`    | 最低日志级别               |
+| `with_thread_id`   | `false`   | 输出线程 ID                |
+| `daily_rotate`     | `true`    | 按天轮转                   |
+| `retain_days`      | `7`       | 保留天数，0 表示不限制     |
+| `max_file_size`    | `0`       | 按大小轮转，0 表示关闭     |
+| `retain_count`     | `0`       | 轮转文件上限，0 表示不限制 |
+| `queue_capacity`   | `65536`   | 队列软上限                 |
+| `overflow_policy`  | `Block`   | 队列满时阻塞或丢弃         |
+| `fatal_sync_flush` | `true`    | Fatal 日志同步落盘         |
 
 完整配置见 [`LogConfig`](lyflog.h)。
 
@@ -95,7 +95,9 @@ cmake --build build -j
 ctest --test-dir build --output-on-failure
 
 ./build/tests/lyflog_benchmark --messages 1000000 --threads 8
+./build/tests/lyflog_benchmark --messages 1000000 --threads 8 \
+  --policy drop
 ```
 
-性能测试报告生产延时的平均值、最小值、最大值、P99 和完整落盘带宽。详细说明见
-[`tests/README.md`](tests/README.md)。
+性能测试报告生产延时的平均值、最小值、最大值、P99、完整落盘带宽和丢弃数。
+详细说明见 [`tests/README.md`](tests/README.md)。

@@ -23,7 +23,13 @@ struct Options {
   std::size_t messages = 200000;
   std::size_t threads =
       std::max<std::size_t>(1, std::thread::hardware_concurrency());
+  std::size_t queue_capacity = 32768;
+  lyflog::OverflowPolicy policy = lyflog::OverflowPolicy::Block;
 };
+
+const char *policy_name(lyflog::OverflowPolicy policy) {
+  return policy == lyflog::OverflowPolicy::Block ? "block" : "drop";
+}
 
 std::size_t parse_positive(const char *text, const char *option) {
   std::size_t value = 0;
@@ -44,8 +50,21 @@ Options parse_options(int argc, char **argv) {
       options.messages = parse_positive(argv[++i], "--messages");
     } else if (argument == "--threads" && i + 1 < argc) {
       options.threads = parse_positive(argv[++i], "--threads");
+    } else if (argument == "--queue-capacity" && i + 1 < argc) {
+      options.queue_capacity = parse_positive(argv[++i], "--queue-capacity");
+    } else if (argument == "--policy" && i + 1 < argc) {
+      const std::string policy = argv[++i];
+      if (policy == "block") {
+        options.policy = lyflog::OverflowPolicy::Block;
+      } else if (policy == "drop") {
+        options.policy = lyflog::OverflowPolicy::Drop;
+      } else {
+        throw std::runtime_error("--policy expects block or drop");
+      }
     } else if (argument == "--help") {
-      std::cout << "Usage: lyflog_benchmark [--messages N] [--threads N]\n";
+      std::cout << "Usage: lyflog_benchmark [--messages N] [--threads N]\n"
+                << "                        [--policy block|drop] "
+                   "[--queue-capacity N]\n";
       std::exit(0);
     } else {
       throw std::runtime_error("unknown or incomplete option: " + argument);
@@ -87,10 +106,12 @@ struct Result {
   double p99_ns = 0.0;
   double end_to_end_seconds = 0.0;
   std::uintmax_t bytes = 0;
+  std::size_t dropped = 0;
 };
 
 Result run_benchmark(const std::string &name, std::size_t thread_count,
-                     std::size_t message_count, const fs::path &path) {
+                     std::size_t message_count, std::size_t queue_capacity,
+                     lyflog::OverflowPolicy policy, const fs::path &path) {
   lyflog::LogConfig config;
   config.set_file_path(path.string())
       .set_level(lyflog::Level::Info)
@@ -98,13 +119,14 @@ Result run_benchmark(const std::string &name, std::size_t thread_count,
       .set_daily_rotate(false)
       .set_file_buffer_size(1024 * 1024)
       .set_batch_size(4096)
-      .set_queue_capacity(32768)
+      .set_queue_capacity(queue_capacity)
       .set_buffer_pool_size(32768)
       .set_tls_buffer_count(64)
-      .set_overflow_policy(lyflog::OverflowPolicy::Block);
+      .set_overflow_policy(policy);
 
   auto &logger = lyflog::Logger::instance();
   logger.init(config);
+  const auto baseline = logger.stats();
 
   std::vector<std::thread> producers;
   producers.reserve(thread_count);
@@ -145,8 +167,10 @@ Result run_benchmark(const std::string &name, std::size_t thread_count,
 
   const auto stats = logger.stats();
   const std::size_t dropped =
-      stats.dropped_overflow + stats.dropped_no_file + stats.shutdown_drop;
-  if (dropped != 0) {
+      (stats.dropped_overflow - baseline.dropped_overflow) +
+      (stats.dropped_no_file - baseline.dropped_no_file) +
+      (stats.shutdown_drop - baseline.shutdown_drop);
+  if (policy == lyflog::OverflowPolicy::Block && dropped != 0) {
     throw std::runtime_error("Block 策略下出现日志丢弃");
   }
   // 多生产者日志通过 shutdown() 全局排空。
@@ -180,7 +204,8 @@ Result run_benchmark(const std::string &name, std::size_t thread_count,
           max_ns,
           latencies_ns[p99_index],
           std::chrono::duration<double>(flushed - begin).count(),
-          bytes};
+          bytes,
+          dropped};
 }
 
 void print_result(const Result &result) {
@@ -193,7 +218,8 @@ void print_result(const Result &result) {
             << result.messages << std::fixed << std::setprecision(1)
             << std::setw(14) << result.avg_ns << std::setw(14) << result.min_ns
             << std::setw(14) << result.max_ns << std::setw(14) << result.p99_ns
-            << std::setw(12) << bandwidth << '\n';
+            << std::setw(12) << bandwidth << std::setw(12) << result.dropped
+            << '\n';
 }
 
 } // namespace
@@ -205,16 +231,21 @@ int main(int argc, char **argv) {
 
     std::cout
         << "lyflog benchmark (includes formatting, queueing, and file I/O)\n"
-        << "messages per case: " << options.messages << "\n\n"
+        << "messages per case: " << options.messages << '\n'
+        << "policy: " << policy_name(options.policy)
+        << ", queue capacity: " << options.queue_capacity << "\n\n"
         << std::left << std::setw(14) << "case" << std::right << std::setw(9)
         << "threads" << std::setw(14) << "messages" << std::setw(14) << "avg ns"
         << std::setw(14) << "min ns" << std::setw(14) << "max ns"
-        << std::setw(14) << "p99 ns" << std::setw(12) << "MiB/s" << '\n';
+        << std::setw(14) << "p99 ns" << std::setw(12) << "MiB/s"
+        << std::setw(12) << "dropped" << '\n';
 
     print_result(run_benchmark("single-thread", 1, options.messages,
+                               options.queue_capacity, options.policy,
                                directory.file("single.log")));
     print_result(run_benchmark("multi-thread", options.threads,
-                               options.messages, directory.file("multi.log")));
+                               options.messages, options.queue_capacity,
+                               options.policy, directory.file("multi.log")));
     return 0;
   } catch (const std::exception &error) {
     std::cerr << "benchmark error: " << error.what() << '\n';
