@@ -76,6 +76,31 @@ std::size_t count_occurrences(const std::string &text,
   return count;
 }
 
+// 小容量 + 多线程洪水：队列必然到达软上限，触发溢出策略。
+// 返回本轮按 Drop 策略丢弃的条数（相对 init 后的基线）。
+constexpr std::size_t kFloodThreads = 4;
+constexpr std::size_t kFloodMessagesPerThread = 10000;
+
+std::size_t flood(const lyflog::LogConfig &config, const std::string &marker) {
+  auto &logger = lyflog::Logger::instance();
+  logger.init(config);
+  const auto baseline = logger.stats();
+  std::vector<std::thread> threads;
+  for (std::size_t thread_id = 0; thread_id < kFloodThreads; ++thread_id) {
+    threads.emplace_back([thread_id, &marker] {
+      for (std::size_t sequence = 0; sequence < kFloodMessagesPerThread;
+           ++sequence) {
+        LYF_INFO("{} thread={} sequence={}", marker, thread_id, sequence);
+      }
+    });
+  }
+  for (auto &thread : threads) {
+    thread.join();
+  }
+  logger.shutdown();
+  return logger.stats().dropped_overflow - baseline.dropped_overflow;
+}
+
 } // namespace
 
 TEST_CASE("level names and config setters", "[config]") {
@@ -228,4 +253,80 @@ TEST_CASE("stats expose runtime configuration", "[stats]") {
   CHECK(logger.stats().level == lyflog::Level::Debug);
   logger.shutdown();
   CHECK_FALSE(logger.stats().running);
+  // 关停排空后水位清零，queue_size 不再有残留计数。
+  CHECK(logger.stats().queue_size == 0);
+}
+
+TEST_CASE("drop policy discards droppable levels under overload",
+          "[logging][overflow]") {
+  TestDirectory directory;
+  const fs::path path = directory.file("drop.log");
+  auto config = test_config(path);
+  config.set_queue_capacity(16).set_overflow_policy(
+      lyflog::OverflowPolicy::Drop);
+
+  const std::size_t dropped = flood(config, "drop-overload");
+  const std::size_t written =
+      count_occurrences(read_file(path), "drop-overload");
+  const std::size_t submitted = kFloodThreads * kFloodMessagesPerThread;
+
+  // 洪水必须真的触发溢出，否则下面的断言没有覆盖到 Drop 路径。
+  CHECK(dropped > 0);
+  CHECK(dropped + written == submitted); // 丢弃计数与落盘数互补
+  CHECK(written > 0);                    // worker 仍在持续消费
+}
+
+TEST_CASE("drop policy keeps error and fatal under overload",
+          "[logging][overflow]") {
+  TestDirectory directory;
+  const fs::path path = directory.file("keep.log");
+  auto config = test_config(path);
+  config.set_queue_capacity(16).set_overflow_policy(
+      lyflog::OverflowPolicy::Drop);
+  auto &logger = lyflog::Logger::instance();
+  logger.init(config);
+  const auto baseline = logger.stats();
+
+  std::vector<std::thread> threads;
+  for (std::size_t thread_id = 0; thread_id < kFloodThreads; ++thread_id) {
+    threads.emplace_back([thread_id] {
+      for (std::size_t sequence = 0; sequence < kFloodMessagesPerThread;
+           ++sequence) {
+        LYF_INFO("keep-flood thread={} sequence={}", thread_id, sequence);
+        if (sequence % 100 == 0) {
+          // 过载期间穿插 Error：不丢弃，等待水位后入队。
+          LYF_ERROR("keep-error thread={} sequence={}", thread_id, sequence);
+        }
+      }
+      // Fatal 在线程收尾提交（默认 fatal_sync_flush=true，走屏障路径）。
+      LYF_FATAL("keep-fatal thread={}", thread_id);
+    });
+  }
+  for (auto &thread : threads) {
+    thread.join();
+  }
+  logger.shutdown();
+
+  const std::size_t dropped =
+      logger.stats().dropped_overflow - baseline.dropped_overflow;
+  const std::string output = read_file(path);
+
+  CHECK(dropped > 0); // 确认过载成立（丢弃的都是 Info 洪水）
+  CHECK(count_occurrences(output, "keep-error") == kFloodThreads * 100);
+  CHECK(count_occurrences(output, "keep-fatal") == kFloodThreads);
+}
+
+TEST_CASE("queue capacity zero disables overflow policy", "[logging][overflow]") {
+  TestDirectory directory;
+  const fs::path path = directory.file("unbounded.log");
+  auto config = test_config(path);
+  config.set_queue_capacity(0).set_overflow_policy(
+      lyflog::OverflowPolicy::Drop);
+
+  const std::size_t dropped = flood(config, "unbounded-marker");
+  const std::size_t written =
+      count_occurrences(read_file(path), "unbounded-marker");
+
+  CHECK(dropped == 0); // 不设限：永不触发溢出丢弃
+  CHECK(written == kFloodThreads * kFloodMessagesPerThread);
 }

@@ -10,6 +10,8 @@
 //           .set_retain_days(7);
 //     lyflog::Logger::instance().init(config);
 //     LYF_INFO("hello {} {}", "world", 42);
+//     // 运行时拼接的格式串需显式包裹（跳过编译期校验）：
+//     LYF_INFO(fmt::runtime(dyn_fmt), value);
 //     LYF_INTERVAL_INFO(5, "heartbeat alive={} qps={}", alive, qps);
 //     // 等待当前线程此前提交的日志落盘；排空所有线程请用 shutdown()
 //     lyflog::Logger::instance().sync();
@@ -65,10 +67,11 @@ inline const char *level_name(Level lv) {
   return "UNKNOWN";
 }
 
-// 队列溢出策略：队列达到 queue_capacity 软上限后的行为。
+// 队列溢出策略：队列水位达到 queue_capacity 软上限后的行为。
 enum class OverflowPolicy {
   Block, // 自旋让出等待水位下降（默认）：保证不丢日志，代价是生产者被反压。
   Drop,  // 立即丢弃并计数：日志完整性让位于服务可用性。
+         // Error/Fatal 级别不丢弃，退化为等待水位下降后入队。
 };
 
 // ==================== 配置 ====================
@@ -83,17 +86,18 @@ struct LogConfig {
   std::string file_path = "app.log";             // 输出文件路径
   Level level = Level::Info;                     // 最低输出级别
   std::string time_format = "%Y-%m-%d %H:%M:%S"; // strftime 格式
-  std::size_t file_buffer_size = 128 * 1024; // 文件全缓冲大小 (字节)
-  std::size_t batch_size = 2048;             // 后台单次消费的批大小
-  std::size_t queue_capacity = 65536; // 软上限：超过后按 overflow_policy 处理
+  std::size_t file_buffer_size = 128 * 1024;     // 文件全缓冲大小 (字节)
+  std::size_t batch_size = 2048;                 // 后台单次消费的批大小
+  std::size_t queue_capacity = 65536;   // 软上限：超过后按 overflow_policy 处理
   std::size_t buffer_pool_size = 65536; // 全局 BufferPool 预分配数量
-  std::size_t tls_buffer_count = 64; // 线程本地一次批发的 Buffer 数量
-  bool with_thread_id = false;       // 前缀是否包含线程 ID
-  bool daily_rotate = true;          // 按天轮转（默认开）
-  std::size_t retain_days = 7; // 按天轮转保留天数（0=不清理）；
-  std::size_t max_file_size = 0; // 按大小轮转阈值（字节，0=不启用）
+  std::size_t tls_buffer_count = 64;    // 线程本地一次批发的 Buffer 数量
+  bool with_thread_id = false;          // 前缀是否包含线程 ID
+  bool daily_rotate = true;             // 按天轮转（默认开）
+  std::size_t retain_days = 7;          // 按天轮转保留天数（0=不清理）；
+  std::size_t max_file_size = 0;        // 按大小轮转阈值（字节，0=不启用）
   std::size_t retain_count = 0; // 轮转文件保留个数上限（0=只考虑 retain_days）
-  OverflowPolicy overflow_policy = OverflowPolicy::Block; // 队列满策略
+  OverflowPolicy overflow_policy =
+      OverflowPolicy::Block;    // 队列满策略（Drop 下 Error/Fatal 不丢）
   bool fatal_sync_flush = true; // LYF_FATAL 是否同步落盘
 
   // setter
@@ -899,12 +903,12 @@ private:
   std::string base_path_; // 轮转基准路径（非轮转模式未使用）
   bool with_thread_id_;
   bool daily_rotate_;
-  std::size_t retain_days_; // 保留天数（0=不清理），轮转后据此删旧
-  std::size_t file_buffer_size_; // setvbuf 缓冲大小，轮转重开时复用
-  std::size_t max_file_size_;    // 按大小轮转阈值（0=不启用）
-  std::size_t retain_count_;     // 轮转文件个数上限（0=不启用）
-  std::int64_t current_day_key_ = 0; // 当前 file_ 对应的本地日期 (YYYYMMDD)
-  std::size_t seq_ = 0; // 当前 (日期内) 序号：按大小轮转的段号
+  std::size_t retain_days_;            // 保留天数（0=不清理），轮转后据此删旧
+  std::size_t file_buffer_size_;       // setvbuf 缓冲大小，轮转重开时复用
+  std::size_t max_file_size_;          // 按大小轮转阈值（0=不启用）
+  std::size_t retain_count_;           // 轮转文件个数上限（0=不启用）
+  std::int64_t current_day_key_ = 0;   // 当前 file_ 对应的本地日期 (YYYYMMDD)
+  std::size_t seq_ = 0;                // 当前 (日期内) 序号：按大小轮转的段号
   std::size_t current_file_bytes_ = 0; // 当前文件已写字节（大小轮转水位）
   // fopen 失败后的退避：next 到期前不重试 rotate（秒级)
   static constexpr int kRotateRetrySec = 30;
@@ -953,6 +957,7 @@ public:
     std::lock_guard<std::mutex> lk(lifecycle_mutex_);
     shutdown_locked();
     cfg_ = cfg;
+    watermark_.store(0, std::memory_order_relaxed);
     cfg_queue_capacity_.store(cfg.queue_capacity, std::memory_order_relaxed);
     cfg_overflow_drop_.store(cfg.overflow_policy == OverflowPolicy::Drop,
                              std::memory_order_relaxed);
@@ -995,12 +1000,12 @@ public:
   struct Stats {
     bool running = false;           // worker 是否在跑
     Level level = Level::Info;      // 当前级别
-    std::size_t queue_size = 0;     // 当前队列水位（近似值）
+    std::size_t queue_size = 0;     // 当前队列水位（含在途预留的近似值）
     std::size_t queue_capacity = 0; // 背压软上限（0=不设限）
     OverflowPolicy overflow_policy = OverflowPolicy::Block;
-    std::size_t dropped_overflow = 0; // 队列满按 Drop 策略丢弃的累计条数
-    std::size_t dropped_no_file = 0; // 文件打开失败丢弃的累计条数
-    std::size_t open_fail_count = 0; // fopen 累计失败次数（成功后不清零）
+    std::size_t dropped_overflow = 0;  // 队列满按 Drop 策略丢弃的累计条数
+    std::size_t dropped_no_file = 0;   // 文件打开失败丢弃的累计条数
+    std::size_t open_fail_count = 0;   // fopen 累计失败次数（成功后不清零）
     std::size_t pool_fallback_new = 0; // 池耗尽走 malloc 兜底的累计次数
     std::size_t shutdown_drop = 0; // 关停窗口（running_=false）丢弃的累计条数
   };
@@ -1008,7 +1013,9 @@ public:
     Stats s;
     s.running = running_.load(std::memory_order_acquire);
     s.level = level();
-    s.queue_size = queue_.size_approx();
+    // 水位计数是入队预留语义，含在途未发布记录，略高于真实队列长度
+    const std::int64_t level_count = watermark_.load(std::memory_order_relaxed);
+    s.queue_size = level_count > 0 ? static_cast<size_t>(level_count) : 0;
     s.queue_capacity = cfg_queue_capacity_.load(std::memory_order_relaxed);
     s.overflow_policy = cfg_overflow_drop_.load(std::memory_order_relaxed)
                             ? OverflowPolicy::Drop
@@ -1037,9 +1044,17 @@ public:
     return tls_cache.get();
   }
 
+  // 提交一条日志：调用线程从 TLS 缓存取 Buffer，fmt 格式化写入后入队。
   template <typename... Args>
-  void submit(Level lv, const char *file, int line, const char *fmt,
-              Args &&...args) {
+  void submit(Level lv, const char *file, int line,
+              fmt::format_string<Args...> fmt, Args &&...args) {
+    // Drop 策略下，可丢弃级别（< Error）在水位超限时直接返回
+    if (cfg_overflow_drop_.load(std::memory_order_relaxed) &&
+        lv < Level::Error && over_watermark() &&
+        running_.load(std::memory_order_relaxed)) {
+      dropped_overflow_.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
     // 热路径只读共享状态：pool_ 的拷贝与 TLS 身份比较。
     std::shared_ptr<detail::BufferPool> pool = pool_;
     if (!pool) {
@@ -1048,9 +1063,8 @@ public:
 
     detail::ThreadLocalBufferCache *cache = get_tls_cache(pool);
     detail::LogBuffer *buf = cache->get();
-    fmt::format_to_n_result<char *> res =
-        fmt::format_to_n(buf->data, detail::kPerLogMaxSize, fmt::runtime(fmt),
-                         std::forward<Args>(args)...);
+    fmt::format_to_n_result<char *> res = fmt::format_to_n(
+        buf->data, detail::kPerLogMaxSize, fmt, std::forward<Args>(args)...);
     buf->length = std::min(res.size, detail::kPerLogMaxSize);
 
     detail::LogRecord r;
@@ -1080,6 +1094,7 @@ public:
     if (!running_.load(std::memory_order_acquire)) {
       return; // 复查：enqueue 前可能已被 shutdown
     }
+    watermark_.fetch_add(1, std::memory_order_relaxed);
     queue_.enqueue(std::move(barrier));
     while (fut.wait_for(std::chrono::milliseconds(50)) !=
            std::future_status::ready) {
@@ -1119,26 +1134,30 @@ private:
     while (queue_.try_dequeue_bulk(std::back_inserter(drain), 4096) > 0) {
       drain.clear();
     }
+    watermark_.store(0, std::memory_order_relaxed);
     if (pool_) {
       detail::RetiredPoolRegistry::retire(std::move(pool_));
     }
   }
 
+  // 水位是否已达软上限（queue_capacity=0 视为不设限）。
+  bool over_watermark() const {
+    const std::size_t cap = cfg_queue_capacity_.load(std::memory_order_relaxed);
+    return cap > 0 && watermark_.load(std::memory_order_relaxed) >=
+                          static_cast<std::int64_t>(cap);
+  }
+
   void push(detail::LogRecord &&r) {
-    // 队列满时的两种策略（queue_capacity=0 均不生效）：
+    // 水位达软上限时在此等待（queue_capacity=0 不生效）：
     //   Block（默认）：自旋让出等水位下降，保证不丢、生产者被反压；
-    //   Drop：立即丢弃并计数——日志完整性让位于服务可用性
-    if (cfg_queue_capacity_ > 0 &&
-        queue_.size_approx() >= cfg_queue_capacity_) {
-      if (cfg_overflow_drop_.load(std::memory_order_relaxed)) {
-        dropped_overflow_.fetch_add(1, std::memory_order_relaxed);
-        return; // ~LogRecord 归还 buffer
-      }
-      while (cfg_queue_capacity_ > 0 &&
-             queue_.size_approx() >= cfg_queue_capacity_ &&
-             running_.load(std::memory_order_relaxed)) {
-        std::this_thread::yield();
-      }
+    //   Drop：可丢弃级别已在 submit() 顶部提前丢弃，不会走到这里；
+    //         Error/Fatal 免删，同样在此等待水位（超限量有界，可接受）。
+    const bool must_wait =
+        !cfg_overflow_drop_.load(std::memory_order_relaxed) ||
+        r.level >= Level::Error;
+    while (must_wait && over_watermark() &&
+           running_.load(std::memory_order_relaxed)) {
+      std::this_thread::yield();
     }
     // 复查：自旋期间若被 shutdown 抢先（worker 已退出），丢弃本条
     if (!running_.load(std::memory_order_relaxed)) {
@@ -1146,7 +1165,8 @@ private:
       return; // ~LogRecord 归还 buffer（TLS 持有的池 shared_ptr 仍存活）
     }
 
-    // 正常入队
+    // 正常入队。
+    watermark_.fetch_add(1, std::memory_order_relaxed);
     queue_.enqueue(std::move(r));
   }
 
@@ -1173,6 +1193,9 @@ private:
         std::this_thread::sleep_for(std::chrono::microseconds(100));
         continue;
       }
+      // 出队即按批减水位（含屏障记录）
+      watermark_.fetch_sub(static_cast<std::int64_t>(n),
+                           std::memory_order_relaxed);
       for (auto &r : batch) {
         // 局部刷新屏障：刷新已处理内容并兑现。
         if (r.sync_prom) {
@@ -1221,6 +1244,8 @@ private:
   std::atomic<bool> cfg_overflow_drop_{false};
   std::atomic<bool> fatal_sync_flush_{true};
   std::atomic<std::size_t> tls_batch_hint_{64};
+  // 队列水位：入队前 +1（预留，屏障同样计数），worker 每批出队后 -n。
+  std::atomic<int64_t> watermark_{0};
   // 丢弃诊断计数
   std::atomic<std::size_t> dropped_overflow_{0};
   std::atomic<std::size_t> shutdown_drop_{0};

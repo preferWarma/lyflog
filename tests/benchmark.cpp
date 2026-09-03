@@ -14,17 +14,38 @@
 #include <thread>
 #include <vector>
 
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
+
 namespace {
 
 namespace fs = std::filesystem;
 using Clock = std::chrono::steady_clock;
 
+// 默认生产线程数：给后台 worker 留一核余量；Apple 上只用性能核，
+// 避免 P/E 核混跑与超售把调度噪声混进策略对比（策略差异集中在中尾部
+// 延迟，对调度噪声最敏感）。
+std::size_t default_producer_threads() {
+#if defined(__APPLE__)
+  int perf_cores = 0;
+  std::size_t size = sizeof(perf_cores);
+  if (sysctlbyname("hw.perflevel0.logicalcpu", &perf_cores, &size, nullptr,
+                   0) == 0 &&
+      perf_cores > 1) {
+    return static_cast<std::size_t>(perf_cores) - 1;
+  }
+#endif
+  const std::size_t hardware = std::thread::hardware_concurrency();
+  return hardware > 1 ? hardware - 1 : 1;
+}
+
 struct Options {
   std::size_t messages = 200000;
-  std::size_t threads =
-      std::max<std::size_t>(1, std::thread::hardware_concurrency());
+  std::size_t threads = default_producer_threads();
   std::size_t queue_capacity = 32768;
   lyflog::OverflowPolicy policy = lyflog::OverflowPolicy::Block;
+  bool sweep = false;
 };
 
 const char *policy_name(lyflog::OverflowPolicy policy) {
@@ -61,10 +82,17 @@ Options parse_options(int argc, char **argv) {
       } else {
         throw std::runtime_error("--policy expects block or drop");
       }
+    } else if (argument == "--sweep") {
+      options.sweep = true;
     } else if (argument == "--help") {
       std::cout << "Usage: lyflog_benchmark [--messages N] [--threads N]\n"
                 << "                        [--policy block|drop] "
-                   "[--queue-capacity N]\n";
+                   "[--queue-capacity N]\n"
+                << "                        [--sweep]\n"
+                << "\n"
+                << "  --sweep   两种策略 × 多档容量（512/4096/--queue-capacity）"
+                   "的矩阵对比\n"
+                << "  默认线程数留一核给后台 worker（Apple 上取性能核）\n";
       std::exit(0);
     } else {
       throw std::runtime_error("unknown or incomplete option: " + argument);
@@ -101,9 +129,10 @@ struct Result {
   std::size_t threads = 0;
   std::size_t messages = 0;
   double avg_ns = 0.0;
-  double min_ns = 0.0;
-  double max_ns = 0.0;
+  double p50_ns = 0.0;
   double p99_ns = 0.0;
+  double p999_ns = 0.0;
+  double max_ns = 0.0;
   double end_to_end_seconds = 0.0;
   std::uintmax_t bytes = 0;
   std::size_t dropped = 0;
@@ -185,27 +214,47 @@ Result run_benchmark(const std::string &name, std::size_t thread_count,
   }
 
   long double total_ns = 0.0;
-  double min_ns = latencies_ns.front();
   double max_ns = latencies_ns.front();
   for (const double latency : latencies_ns) {
     total_ns += latency;
-    min_ns = std::min(min_ns, latency);
     max_ns = std::max(max_ns, latency);
   }
-  const std::size_t p99_index = message_count - message_count / 100 - 1;
-  std::nth_element(latencies_ns.begin(), latencies_ns.begin() + p99_index,
-                   latencies_ns.end());
+  // 分位数（nearest-rank，自顶向下数 tail_count 条的边界）：
+  // p99 是 Block 反压等待是否越过 1% 阈值的观测点，而 p99.9/max 才是
+  // 等待的真实聚集区——只看 p99 会误判两种策略差异不大。
+  auto percentile = [&latencies_ns](std::size_t tail_count) {
+    const std::size_t index =
+        latencies_ns.size() > tail_count ? latencies_ns.size() - tail_count - 1
+                                         : 0;
+    std::nth_element(latencies_ns.begin(),
+                     latencies_ns.begin() + static_cast<std::ptrdiff_t>(index),
+                     latencies_ns.end());
+    return latencies_ns[index];
+  };
+  const double p50 = percentile(latencies_ns.size() / 2);
+  const double p99 = percentile(latencies_ns.size() / 100);
+  const double p999 = percentile(latencies_ns.size() / 1000);
 
   return {name,
           thread_count,
           message_count,
           static_cast<double>(total_ns / message_count),
-          min_ns,
+          p50,
+          p99,
+          p999,
           max_ns,
-          latencies_ns[p99_index],
           std::chrono::duration<double>(flushed - begin).count(),
           bytes,
           dropped};
+}
+
+void print_header() {
+  std::cout << std::left << std::setw(20) << "case" << std::right
+            << std::setw(9) << "threads" << std::setw(12) << "messages"
+            << std::setw(11) << "avg ns" << std::setw(11) << "p50 ns"
+            << std::setw(11) << "p99 ns" << std::setw(12) << "p99.9 ns"
+            << std::setw(13) << "max ns" << std::setw(11) << "MiB/s"
+            << std::setw(18) << "dropped" << '\n';
 }
 
 void print_result(const Result &result) {
@@ -213,13 +262,34 @@ void print_result(const Result &result) {
   const double bandwidth =
       (static_cast<double>(result.bytes) / kMiB) / result.end_to_end_seconds;
 
-  std::cout << std::left << std::setw(14) << result.name << std::right
-            << std::setw(9) << result.threads << std::setw(14)
+  std::string dropped;
+  if (result.dropped == 0) {
+    dropped = "0";
+  } else {
+    std::ostringstream stream;
+    stream << result.dropped << " (" << std::fixed << std::setprecision(1)
+           << 100.0 * static_cast<double>(result.dropped) / result.messages
+           << "%)";
+    dropped = stream.str();
+  }
+
+  std::cout << std::left << std::setw(20) << result.name << std::right
+            << std::setw(9) << result.threads << std::setw(12)
             << result.messages << std::fixed << std::setprecision(1)
-            << std::setw(14) << result.avg_ns << std::setw(14) << result.min_ns
-            << std::setw(14) << result.max_ns << std::setw(14) << result.p99_ns
-            << std::setw(12) << bandwidth << std::setw(12) << result.dropped
-            << '\n';
+            << std::setw(11) << result.avg_ns << std::setw(11) << result.p50_ns
+            << std::setw(11) << result.p99_ns << std::setw(12) << result.p999_ns
+            << std::setw(13) << result.max_ns << std::setw(11) << bandwidth
+            << std::setw(18) << dropped << '\n';
+}
+
+// 扫描容量档位：小（必溢出）/ 中（间歇溢出）/ 配置值（常不溢出）。
+// 只有 dropped > 0 的行才说明溢出策略真的被触发，对比才有意义。
+std::vector<std::size_t> sweep_capacities(std::size_t configured) {
+  std::vector<std::size_t> capacities{512, 4096, configured};
+  std::sort(capacities.begin(), capacities.end());
+  capacities.erase(std::unique(capacities.begin(), capacities.end()),
+                   capacities.end());
+  return capacities;
 }
 
 } // namespace
@@ -231,15 +301,29 @@ int main(int argc, char **argv) {
 
     std::cout
         << "lyflog benchmark (includes formatting, queueing, and file I/O)\n"
-        << "messages per case: " << options.messages << '\n'
-        << "policy: " << policy_name(options.policy)
-        << ", queue capacity: " << options.queue_capacity << "\n\n"
-        << std::left << std::setw(14) << "case" << std::right << std::setw(9)
-        << "threads" << std::setw(14) << "messages" << std::setw(14) << "avg ns"
-        << std::setw(14) << "min ns" << std::setw(14) << "max ns"
-        << std::setw(14) << "p99 ns" << std::setw(12) << "MiB/s"
-        << std::setw(12) << "dropped" << '\n';
+        << "messages per case: " << options.messages
+        << ", producer threads: " << options.threads << ", worker: 1\n\n";
 
+    if (options.sweep) {
+      print_header();
+      for (const auto policy :
+           {lyflog::OverflowPolicy::Block, lyflog::OverflowPolicy::Drop}) {
+        for (const std::size_t capacity :
+             sweep_capacities(options.queue_capacity)) {
+          const std::string name =
+              std::string(policy_name(policy)) + " cap=" +
+              std::to_string(capacity);
+          print_result(run_benchmark(
+              name, options.threads, options.messages, capacity, policy,
+              directory.file(name + ".log")));
+        }
+      }
+      return 0;
+    }
+
+    std::cout << "policy: " << policy_name(options.policy)
+              << ", queue capacity: " << options.queue_capacity << "\n\n";
+    print_header();
     print_result(run_benchmark("single-thread", 1, options.messages,
                                options.queue_capacity, options.policy,
                                directory.file("single.log")));
